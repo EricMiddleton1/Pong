@@ -30,6 +30,8 @@
  *The game is rendered on a 128x128 back buffer and is stretched onto the screen
  *whenever the window is redrawn.
  *The game is updated approximately 100 times per second using a standard Windows timer event
+ *
+ *There is a precompiled version of this program located at: https://drive.google.com/file/d/0B33_0mkAWVhcTWFEOVAwQV96eHc/edit?usp=sharing
 */
 
 
