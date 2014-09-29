@@ -30,8 +30,6 @@
  *The game is rendered on a 128x128 back buffer and is stretched onto the screen
  *whenever the window is redrawn.
  *The game is updated approximately 100 times per second using a standard Windows timer event
- *
- *There is a precompiled version of this program located at: https://drive.google.com/file/d/0B33_0mkAWVhcTWFEOVAwQV96eHc/edit?usp=sharing
 */
 
 
@@ -48,6 +46,7 @@
 #define	PLAYER_SPEED	1.5f
 #define RESOLUTION		128
 #define MARGIN			32
+#define TOUCH_WIDTH		0.02f
 
 //State definitions
 #define STATE_HOME		0
@@ -79,14 +78,21 @@ typedef struct Paddle {
 	float height;
 } Paddle;
 
+typedef struct Buffer {
+	HDC hdc;
+	HBITMAP bitmap, old;
+	unsigned short x, y;
+} Buffer;
+
 //Global variables
 //These are needed because all of the processing
 //is done inside the Windows event loop system
 Paddle player2, player;
 Ball ball;
+Buffer gameBuffer, touchBuffer;
 byte state, score, mode;
 unsigned short width, height;
-bool stateChange;
+bool stateChange, touch;
 
 //Windows event loop function
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -99,7 +105,10 @@ void ApplyEnglish(Ball *b, Paddle p);
 void UpdateBall(Ball *b, Paddle player, Paddle player2);
 void DrawTableText(HDC hdc, HFONT font, unsigned short x, unsigned short y, unsigned short width, unsigned short height, byte format, char *str);
 void DrawTable(HDC hdc, Ball b, Paddle player, Paddle player2, byte score, byte state, byte mode);
-
+int PaddleToSlider(Paddle p, unsigned short height);
+void SliderToPaddle(unsigned short slider, Paddle *p, unsigned short width);
+void DrawTouchControls(HDC hdc, unsigned short width, unsigned short height, byte state, byte mode);
+void ProcessTouch(HWND hWnd, WPARAM wParam, LPARAM lParam, Paddle *player1, Paddle *player2, unsigned short width, unsigned short height);
 
 /*
  *int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
@@ -112,9 +121,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	HWND hWnd;
 	MSG msg;
 	HDC hdc;
+	char **argv;
+	int argc, i;
 
-	//Seed the random number generator with the time
-	srand(time());
+	//Check the command line parameters for '-touch'
+	//which will enable touch mode
+	touch = true;
+	argv = CommandLineToArgvW(lpCmdLine, &argc);
+	for (i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "-notouch") == 0) {
+			touch = false;
+			break;
+		}
+	}
 
 	wc.cbSize = sizeof(WNDCLASSEX);
 	wc.style = 0;
@@ -143,14 +162,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	hWnd = CreateWindow("PongGame", "Pong", WS_POPUP, 0, 0, width, height, NULL, NULL, hInstance, NULL);
 
 	//Alert the user if the window was not created and then close
-	if (!hWnd) {
+	if (hWnd == NULL) {
 		MessageBox(NULL, "Error: Window Creation Failed!", "Pong", MB_ICONEXCLAMATION | MB_OK);
 		return -1;
 	}
+	
+	//Set up our off-screen drawing buffers
+	hdc = GetDC(hWnd);
+	gameBuffer.hdc = CreateCompatibleDC(hdc);
+	gameBuffer.bitmap = CreateCompatibleBitmap(hdc, RESOLUTION, RESOLUTION);
+	gameBuffer.old = SelectObject(gameBuffer.hdc, gameBuffer.bitmap);
+	gameBuffer.x = RESOLUTION;
+	gameBuffer.y = RESOLUTION;
 
-	//Show the window
-	ShowWindow(hWnd, nCmdShow);
-	UpdateWindow(hWnd);
+	if (touch) { //We use an extra buffer for the touch controls
+		touchBuffer.hdc = CreateCompatibleDC(hdc);
+		touchBuffer.bitmap = CreateCompatibleBitmap(hdc, width, height);
+		touchBuffer.old = SelectObject(touchBuffer.hdc, touchBuffer.bitmap);
+		touchBuffer.x = width;
+		touchBuffer.y = height;
+
+		//Tell Windows to send us touch messages
+		RegisterTouchWindow(hWnd, 0);
+	}
+	//Clean it up
+	ReleaseDC(hWnd, hdc);
 
 	//initialize variables
 	score = 0;
@@ -161,8 +197,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	player2.height = (RESOLUTION + MARGIN) / 2.f;
 	player.height = (RESOLUTION + MARGIN) / 2.f;
 
+	//Hide the cursor
+	ShowCursor(false);
+
 	//Set the update timer
 	SetTimer(hWnd, 1, 10, NULL);
+
+	//Show the window
+	ShowWindow(hWnd, nCmdShow);
+	UpdateWindow(hWnd);
 
 	//Enter the event loop
 	while (GetMessage(&msg, NULL, 0, 0)) {
@@ -181,7 +224,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
  *process messages in the event loop.
  *The entire game is run through this function
 */
-int error;
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	//There are hundreds (or maybe thousands) of different window messages.
 	//We will switch through the only ones we need and have Windows automatically
@@ -191,8 +233,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		case WM_CREATE:
 			//Seed the random number generator with the time
 			srand(time());
-			//Hide the cursor
-			ShowCursor(false);
 		break;
 
 		//The window has been asked to close
@@ -200,8 +240,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			DestroyWindow(hWnd);
 		break;
 
+		case WM_TOUCH:
+			if (touch)
+				ProcessTouch(hWnd, wParam, lParam, &player, &player2, width, height);
+
+				return DefWindowProc(hWnd, msg, wParam, lParam);
+		break;
+
 		//The program is closing
 		case WM_DESTROY:
+			SelectObject(gameBuffer.hdc, gameBuffer.old);
+			DeleteObject(gameBuffer.bitmap);
+			DeleteDC(gameBuffer.hdc);
+
+			if (touch) {
+				SelectObject(touchBuffer.hdc, touchBuffer.old);
+				DeleteObject(touchBuffer.bitmap);
+				DeleteDC(touchBuffer.hdc);
+			}
 			PostQuitMessage(0);
 		break;
 
@@ -251,11 +307,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			//When the appropriate keys are pressed
 			if (state != STATE_HOME) {
 				player.height += PLAYER_SPEED * (!!(GetAsyncKeyState('S') & 0x8000) - !!(GetAsyncKeyState('W') & 0x8000));
-				player.height = CLAMP(player.height, MARGIN + PADDLEHEIGHT / 2.f, RESOLUTION - PADDLEHEIGHT / 2.f);
+				player.height = CLAMP(player.height, MARGIN + PADDLEHEIGHT / 2.f + 1, RESOLUTION - PADDLEHEIGHT / 2.f);
 
 				if(mode == MODE_TWO) {
 					player2.height += PLAYER_SPEED * (!!(GetAsyncKeyState('L') & 0x8000) - !!(GetAsyncKeyState('O') & 0x8000));
-					player2.height = CLAMP(player2.height, MARGIN + PADDLEHEIGHT / 2.f, RESOLUTION - PADDLEHEIGHT / 2.f);
+					player2.height = CLAMP(player2.height, MARGIN + PADDLEHEIGHT / 2.f + 1, RESOLUTION - PADDLEHEIGHT / 2.f);
 				}
 			}
 
@@ -286,18 +342,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		{
 			//Create the back buffer for flicker-free drawing
 			PAINTSTRUCT ps;
-			HDC hdc = BeginPaint(hWnd, &ps), bdc = CreateCompatibleDC(hdc);
-			HBITMAP bBitmap = CreateCompatibleBitmap(hdc, RESOLUTION, RESOLUTION), oldBitmap;
-			oldBitmap = SelectObject(bdc, bBitmap);
+			HDC hdc = BeginPaint(hWnd, &ps);
 
-			//Render the game on the back buffer and stretch it onto the screen
-			DrawTable(bdc, ball, player, player2, score, state, mode);
-			StretchBlt(hdc, (width - height) / 2, 0, height, height, bdc, 0, 0, RESOLUTION, RESOLUTION, SRCCOPY);
+			//Render the game on the back buffer
+			DrawTable(gameBuffer.hdc, ball, player, player2, score, state, mode);
 
-			//Clean up the drawing objects to avoid a memory leak
-			SelectObject(bdc, oldBitmap);
-			DeleteObject(bBitmap);
-			DeleteDC(bdc);
+			//Render the touch controls if touch mode is enabled
+			if (touch) {
+				DrawTouchControls(touchBuffer.hdc, width, height, state, mode, player, player2);
+				StretchBlt(touchBuffer.hdc, (width - height) / 2, 0, height, height, gameBuffer.hdc, 0, 0, RESOLUTION, RESOLUTION, SRCCOPY);
+				BitBlt(hdc, 0, 0, width, height, touchBuffer.hdc, 0, 0, SRCCOPY);
+
+			}
+			else
+				StretchBlt(hdc, (width - height) / 2, 0, height, height, gameBuffer.hdc, 0, 0, RESOLUTION, RESOLUTION, SRCCOPY);
+
 			EndPaint(hWnd, &ps);
 		}
 		break;
@@ -308,6 +367,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		break;
 	
 	}
+
+	return 0;
 }
 
 /*
@@ -326,7 +387,7 @@ void UpdateAI(Paddle *AI, Ball b) {
 
 	height = AI->height + speed;
 	
-	AI->height = CLAMP(height, MARGIN + PADDLEHEIGHT/2.f + 1, RESOLUTION - PADDLEHEIGHT/2.f); //Keep the paddle on the table
+	AI->height = CLAMP(height, MARGIN + PADDLEHEIGHT/2.f, RESOLUTION - PADDLEHEIGHT/2.f); //Keep the paddle on the table
 }
 
 /*
@@ -457,14 +518,211 @@ void DrawTableText(HDC hdc, HFONT font, unsigned short x, unsigned short y, unsi
 
 	oldFont = SelectObject(hdc, font);
 
-	DrawText(hdc, str, -1, &r, format | DT_TOP);
+	DrawText(hdc, str, -1, &r, format);
 
 	SelectObject(hdc, oldFont);
 }
 
 /*
+ *void PaddleToSlider(Paddle, unsigned short, unsigned short)
+ *This function coverts the paddle position into a touch slider position
+*/
+int PaddleToSlider(Paddle p, unsigned short width, unsigned short height) {
+	unsigned short margin = (width - height) / 2;
+
+	return height / 3 + height / 3 * (p.height - MARGIN - PADDLEHEIGHT / 2) / (RESOLUTION - MARGIN - PADDLEHEIGHT);
+}
+
+/*
+ *void SliderToPaddle(unsigned short, Paddle*, unsigned short, unsigned short)
+ *This function converts the touch slider position into a paddle position
+*/
+void SliderToPaddle(unsigned short slider, Paddle *p, unsigned short width, unsigned short height) {
+	unsigned short margin = (width - height) / 2;
+	
+	p->height = 3 * (RESOLUTION - MARGIN - PADDLEHEIGHT)*(slider - height / 3) / height + MARGIN + PADDLEHEIGHT / 2;
+
+}
+
+/*
+ *void DrawTouchControls(hdc, unsigned short, unsigned short, byte, byte, Paddle, Paddle)
+ *This function will draw the touch controls onto the left and right edge
+ *of the screen for every game state
+*/
+void DrawTouchControls(HDC hdc, unsigned short width, unsigned short height, byte state, byte mode, Paddle player1, Paddle player2) {
+	HBRUSH oldBrush, redBrush = CreateSolidBrush(0x000000FF), goldBrush = CreateSolidBrush(0x0000D7FF);
+	HPEN oldPen, nullPen = CreatePen(PS_NULL, 0, 0x00000000), whitePen = CreatePen(PS_SOLID, height*TOUCH_WIDTH/5, 0x00FFFFFF);
+	HFONT oldFont, font = CreateFontA(height/15, 0, 0, 0, 0, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Calibri");
+	unsigned short margin = (width - height) / 2, slider;
+	RECT r;
+	
+	r.bottom = height;
+	r.left = 0;
+	r.right = width;
+	r.top = 0;
+	
+	FillRect(hdc, &r, GetStockObject(BLACK_BRUSH));
+
+	SetTextColor(hdc, 0x00FFFFFF);
+	SetBkMode(hdc, TRANSPARENT);
+
+	if (state == STATE_READY || state == STATE_SERVE || state == STATE_PLAY) {
+		oldBrush = SelectObject(hdc, GetStockObject(GRAY_BRUSH));
+		oldPen = SelectObject(hdc, nullPen);
+
+		slider = PaddleToSlider(player1, width, height);
+
+		Rectangle(hdc, margin / 2 - margin*TOUCH_WIDTH, height * 1 / 3, margin / 2 + margin*TOUCH_WIDTH, height * 2 / 3);
+		SelectObject(hdc, redBrush);
+		Ellipse(hdc,
+			margin / 2 - 5 * margin*TOUCH_WIDTH,
+			slider - 5 * margin*TOUCH_WIDTH,
+			margin / 2 + 5 * margin*TOUCH_WIDTH,
+			slider + 5 * margin*TOUCH_WIDTH);
+			
+		if (mode == MODE_TWO) {
+			slider = PaddleToSlider(player2, width, height);
+
+			SelectObject(hdc, GetStockObject(GRAY_BRUSH));
+			Rectangle(hdc, width - margin / 2 - margin*TOUCH_WIDTH, height * 1 / 3, width - margin / 2 + margin*TOUCH_WIDTH, height * 2 / 3);
+			SelectObject(hdc, goldBrush);
+			Ellipse(hdc,
+				width - margin / 2 - 5 * margin*TOUCH_WIDTH,
+				slider - 5 * margin*TOUCH_WIDTH,
+				width - margin / 2 + 5 * margin*TOUCH_WIDTH,
+				slider + 5 * margin*TOUCH_WIDTH);
+		}
+		SelectObject(hdc, oldBrush);
+		SelectObject(hdc, oldPen);
+	}
+
+	if (state != STATE_SERVE && state != STATE_PLAY) {
+		short buttonShift = height / 30 - height / 15 * (state == STATE_HOME);
+		oldFont = SelectObject(hdc, font);
+		oldPen = SelectObject(hdc, nullPen);
+		oldBrush = SelectObject(hdc, GetStockObject(GRAY_BRUSH));
+
+		Rectangle(hdc, margin*TOUCH_WIDTH, 
+			buttonShift + height / 2 - height / 30, 
+			margin*TOUCH_WIDTH + margin / 4, 
+			buttonShift + height / 2 + height / 30);
+		DrawTableText(hdc, font, margin*TOUCH_WIDTH, buttonShift + height / 2 - height / 30, margin*TOUCH_WIDTH + margin / 4, height / 15, DT_CENTER | DT_VCENTER, "Go!");
+		
+		SelectObject(hdc, oldFont);
+		SelectObject(hdc, oldPen);
+		SelectObject(hdc, oldBrush);
+	}
+	if (state == STATE_HOME) {
+		oldPen = SelectObject(hdc, nullPen);
+		oldBrush = SelectObject(hdc, GetStockObject(GRAY_BRUSH));
+
+		Rectangle(hdc, margin / 2 - 5 * margin*TOUCH_WIDTH,
+			height / 2 - 11 * margin*TOUCH_WIDTH,
+			margin / 2 + 5 * margin*TOUCH_WIDTH,
+			height / 2 - margin*TOUCH_WIDTH);
+		Rectangle(hdc, margin / 2 - 5 * margin*TOUCH_WIDTH,
+			height / 2 + 1 * margin*TOUCH_WIDTH,
+			margin / 2 + 5 * margin*TOUCH_WIDTH,
+			height / 2 + 11 * margin*TOUCH_WIDTH);
+
+		SelectObject(hdc, whitePen);
+
+		MoveToEx(hdc, margin / 2 - 4 * margin*TOUCH_WIDTH, height / 2 - 2*margin*TOUCH_WIDTH, NULL);
+		LineTo(hdc, margin / 2, height / 2 - 10 * margin*TOUCH_WIDTH);
+		LineTo(hdc, margin / 2 + 4 * margin*TOUCH_WIDTH, height / 2 - 2*margin*TOUCH_WIDTH);
+
+		MoveToEx(hdc, margin / 2 - 4 * margin*TOUCH_WIDTH, height / 2 + 2*margin*TOUCH_WIDTH, NULL);
+		LineTo(hdc, margin / 2, height / 2 + 10 * margin*TOUCH_WIDTH);
+		LineTo(hdc, margin / 2 + 4 * margin*TOUCH_WIDTH, height / 2 + 2*margin*TOUCH_WIDTH);
+
+		SelectObject(hdc, oldPen);
+		SelectObject(hdc, oldBrush);
+	}
+
+	oldBrush = SelectObject(hdc, GetStockObject(GRAY_BRUSH));
+	oldPen = SelectObject(hdc, nullPen);
+	
+	Rectangle(hdc, margin*TOUCH_WIDTH,
+		height - margin*TOUCH_WIDTH - height / 15,
+		margin*TOUCH_WIDTH + height/7,
+		height - margin*TOUCH_WIDTH);
+	DrawTableText(hdc, font, margin*TOUCH_WIDTH, height - margin*TOUCH_WIDTH - height / 15, height / 7, height / 15, DT_VCENTER | DT_CENTER, "Close");
+
+	DeleteObject(redBrush);
+	DeleteObject(goldBrush);
+	DeleteObject(nullPen);
+	DeleteObject(whitePen);
+	DeleteObject(font);
+}
+
+/*
+ *void ProcessTouch(HWND, WPARAM, LPARAM, Paddle *, Paddle*, unsigned short, unsigned short)
+ *This function processes Windows touch messages
+*/
+void ProcessTouch(HWND hWnd, WPARAM wParam, LPARAM lParam, Paddle *player1, Paddle* player2, unsigned short width, unsigned short height) {
+	UINT nPoints = LOWORD(wParam), i, slider1 = PaddleToSlider(*player1, width, height),
+		slider2 = PaddleToSlider(*player2, width, height), margin = (width - height) / 2;
+	PTOUCHINPUT points = malloc(sizeof(TOUCHINPUT) * nPoints);
+	short buttonShift = height / 30 - height / 15 * (state == STATE_HOME);
+	
+	//Uh oh...
+	if (points == NULL)
+		return;
+
+	GetTouchInputInfo((HTOUCHINPUT)lParam, nPoints, points, sizeof(TOUCHINPUT));
+	for (i = 0; i < nPoints; i++) {
+		TOUCHINPUT point = points[i];
+		point.x /= 100;
+		point.y /= 100;
+
+		if (state == STATE_READY || state == STATE_SERVE || state == STATE_PLAY) {
+			if ((point.x >= (margin / 2 - 10 * TOUCH_WIDTH*margin)) && (point.x <= (margin / 2 + 10 * TOUCH_WIDTH*margin)) &&
+				(point.y >= (height / 3)) && (point.y <= (height * 2 / 3))) {
+				SliderToPaddle(point.y, player1, width, height);
+			}
+			else if ((mode == MODE_TWO) && (point.x >= (width - margin / 2 - 10 * TOUCH_WIDTH*margin)) && (point.x <= (width - margin / 2 + 10 * TOUCH_WIDTH*margin)) &&
+				(point.y >= (height / 3)) && (point.y <= (height * 2 / 3))) {
+				SliderToPaddle(point.y, player2, width, height);
+			}
+		}
+		if (state != STATE_PLAY && state != STATE_SERVE && (point.x >= (margin*TOUCH_WIDTH)) && (point.x <= (margin*TOUCH_WIDTH + margin / 4)) &&
+				(point.y >= (height / 2 - height / 30 + buttonShift)) && (point.y <= (height / 2 + height / 30 + buttonShift))) {
+			switch (state) {
+			case STATE_HOME:
+				state = STATE_READY;
+				score = 0;
+				break;
+			case STATE_READY:
+				state = STATE_SERVE;
+				break;
+			case STATE_END:
+				state = STATE_HOME;
+				break;
+			}
+			stateChange = true;
+		}
+		if (state == STATE_HOME) {
+			if ((point.x >= (margin / 2 - 5 * margin*TOUCH_WIDTH)) && (point.x <= (margin / 2 + 5 * margin*TOUCH_WIDTH)) &&
+				(point.y >= (height / 2 - 11 * margin*TOUCH_WIDTH)) && (point.y <= (height / 2 - margin*TOUCH_WIDTH))) {
+				mode = MODE_ONE;
+				stateChange = true;
+			}
+			else if ((point.x >= (margin / 2 - 5 * margin*TOUCH_WIDTH)) && (point.x <= (margin / 2 + 5 * margin*TOUCH_WIDTH)) &&
+				(point.y >= (height / 2 + margin*TOUCH_WIDTH)) && (point.y <= (height / 2 + 11 * margin*TOUCH_WIDTH))) {
+				mode = MODE_TWO;
+				stateChange = true;
+			}
+		}
+		if ((point.x >= (margin*TOUCH_WIDTH)) && (point.x <= (margin*TOUCH_WIDTH + margin / 3)) &&
+			(point.y >= (height - margin*TOUCH_WIDTH - height / 15)) && (point.y <= (height - margin*TOUCH_WIDTH))) {
+			DestroyWindow(hWnd);
+		}
+	}
+}
+
+/*
  *void DrawTable(HDC, Ball, Paddle, Paddle, byte, byte, byte)
- *This function handles draws the game for every state
+ *This function draws the game for every state
 */
 void DrawTable(HDC hdc, Ball b, Paddle player, Paddle player2, byte score, byte state, byte mode) {
 	byte i;
@@ -473,13 +731,19 @@ void DrawTable(HDC hdc, Ball b, Paddle player, Paddle player2, byte score, byte 
 	HPEN pen = CreatePen(PS_NULL, 1, 0x00000000), oldPen, whitePen = GetStockObject(WHITE_PEN);
 	HFONT bigFont = CreateFontA(20, 0, 0, 0, 0, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Courier New");
 	HFONT smallFont = CreateFontA(15, 0, 0, 0, 0, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Courier New");
+	RECT r;
+
+	r.bottom = RESOLUTION;
+	r.left = 0;
+	r.right = RESOLUTION;
+	r.top = 0;
 
 	//Sets text appearance
 	SetBkColor(hdc, 0x00000000);
 	SetTextColor(hdc, 0x00FFFFFF);
 
 	//Fill the screen with black
-	BitBlt(hdc, 0, 0, RESOLUTION, RESOLUTION, NULL, 0, 0, BLACKNESS);
+	FillRect(hdc, &r, GetStockObject(BLACK_BRUSH));
 
 	//Use a white brush
 	oldBrush = SelectObject(hdc, brush);
@@ -508,7 +772,7 @@ void DrawTable(HDC hdc, Ball b, Paddle player, Paddle player2, byte score, byte 
 
 	DrawTableText(hdc, bigFont, 0, 0, MARGIN, MARGIN, DT_LEFT, pStr);
 	DrawTableText(hdc, bigFont, RESOLUTION - MARGIN, 0, MARGIN, MARGIN, DT_RIGHT, player2Str);
-	DrawTableText(hdc, bigFont, RESOLUTION / 2 - MARGIN, 0, 2 * MARGIN, MARGIN, DT_CENTER, "Pong");
+	DrawTableText(hdc, bigFont, RESOLUTION / 2 - MARGIN, 0, 2 * MARGIN, MARGIN, DT_CENTER, "CyPong");
 
 	//Draw different things based on state
 	if (state == STATE_PLAY) //If the state is play
